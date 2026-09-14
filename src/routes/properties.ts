@@ -1,0 +1,291 @@
+import { Router } from "express";
+import multer from "multer";
+import { z } from "zod";
+import { Peril } from "@prisma/client";
+import { prisma } from "../lib/db.js";
+import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
+import { PRESETS } from "../lib/presets.js";
+import { dollarsToCents, requiredCoverageCents } from "../lib/money.js";
+import { putObject, safeKey } from "../lib/storage.js";
+
+export const propertiesRouter = Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8_000_000 } });
+
+const submitPropertySchema = z.object({
+  address: z.string().trim().min(1, "Address is required."),
+  preset: z.string().trim().min(1, "Select a market."),
+  peril: z.enum(["FL_HURRICANE", "FL_FLOOD", "CA_WILDFIRE", "CA_EARTHQUAKE"], {
+    message: "Select a covered peril.",
+  }),
+  mortgage: z.string().trim().default("0"),
+  value: z.string().trim().min(1, "Estimated value is required."),
+  lenderName: z.string().trim().min(1, "Lender name is required."),
+  lenderEmail: z
+    .union([z.literal(""), z.string().trim().email("Enter a valid lender email.")])
+    .optional()
+    .default(""),
+  servicer: z.string().trim().optional().default(""),
+  sameRiskCovered: z.string().optional(),
+  ownerDays: z.coerce.number().int().min(1).max(365).optional().default(45),
+});
+
+propertiesRouter.get(
+  "/",
+  requireAuth,
+  wrap(async (req, res) => {
+    const where = req.user!.role === "ADMIN" ? {} : { ownerId: req.user!.id };
+    const properties = await prisma.property.findMany({
+      where,
+      include: {
+        mortgage: true,
+        eligibility: { orderBy: { checkedAt: "desc" }, take: 1 },
+        listings: { include: { quote: true, policy: true } },
+        quoteRequests: { include: { quote: true, carrierProduct: true } },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ properties });
+  }),
+);
+
+propertiesRouter.get(
+  "/:id",
+  requireAuth,
+  wrap(async (req, res) => {
+    const property = await prisma.property.findUnique({
+      where: { id: req.params.id as string },
+      include: {
+        mortgage: true,
+        owner: { select: { id: true, name: true, email: true } },
+        eligibility: { orderBy: { checkedAt: "desc" } },
+        documents: true,
+        listings: {
+          include: {
+            quote: true,
+            policy: true,
+            contributions: { include: { user: { select: { email: true, name: true } } } },
+            ledger: true,
+          },
+        },
+        quoteRequests: { include: { quote: true, carrierProduct: true } },
+      },
+    });
+    if (!property) {
+      res.status(404).json({ error: "Property not found." });
+      return;
+    }
+    const allowed =
+      req.user!.role === "ADMIN" ||
+      req.user!.role === "CARRIER" ||
+      property.ownerId === req.user!.id;
+    if (!allowed) {
+      res.status(403).json({ error: "Not allowed." });
+      return;
+    }
+    res.json({ property });
+  }),
+);
+
+propertiesRouter.post(
+  "/:id/reverify",
+  requireAuth,
+  requireRole("ADMIN"),
+  wrap(async (req, res) => {
+    const property = await prisma.property.findUnique({
+      where: { id: req.params.id as string },
+      include: {
+        mortgage: true,
+        listings: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: { quote: true, policy: true },
+        },
+      },
+    });
+    if (!property) {
+      res.status(404).json({ error: "Property not found." });
+      return;
+    }
+
+    const mortgageBalance = property.mortgage?.outstandingBalanceCents ?? 0;
+    const required = requiredCoverageCents(mortgageBalance);
+    const latestListing = property.listings[0];
+    const proposedCoverage = latestListing?.quote.coverageCents ?? property.estimatedValueCents;
+    const bufferOk = proposedCoverage >= required;
+
+    const check = await prisma.eligibilityCheck.create({
+      data: {
+        propertyId: property.id,
+        bufferPassed: bufferOk,
+        kycPassed: true,
+        sameRiskCovered: false,
+        inRiskZone: true,
+        requiredCoverageCents: required,
+        proposedCoverageCents: proposedCoverage,
+        notes: bufferOk
+          ? "Annual re-verification: 35% equity buffer still satisfied."
+          : `Annual re-verification FAILED: coverage ${proposedCoverage} cents is below required ${required} cents (mortgage × 1.35). Listing should be suspended pending re-qualification.`,
+      },
+    });
+
+    res.json({ eligibility: check, bufferPassed: bufferOk });
+  }),
+);
+
+propertiesRouter.post(
+  "/",
+  requireAuth,
+  requireKyc,
+  requireRole("OWNER", "ADMIN"),
+  upload.single("deed"),
+  wrap(async (req, res) => {
+    const parsed = submitPropertySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid submission." });
+      return;
+    }
+    const body = parsed.data;
+    const address = body.address;
+    const preset = body.preset;
+    const peril = body.peril as Peril;
+    const mortgageBalance = dollarsToCents(body.mortgage);
+    const estimatedValue = dollarsToCents(body.value);
+    const lenderName = body.lenderName;
+    const lenderEmail = body.lenderEmail;
+    const servicer = body.servicer;
+    const sameRiskCovered = body.sameRiskCovered === "on" || body.sameRiskCovered === "true";
+    const ownerDays = body.ownerDays;
+    const place = PRESETS[preset];
+
+    if (!place || estimatedValue <= 0) {
+      res.status(400).json({
+        error: "Select a valid market and enter an estimated value greater than zero.",
+      });
+      return;
+    }
+    if (
+      (place.state === "FL" && !peril.startsWith("FL_")) ||
+      (place.state === "CA" && !peril.startsWith("CA_"))
+    ) {
+      res.status(400).json({ error: "Peril must match the launch market." });
+      return;
+    }
+
+    const required = requiredCoverageCents(mortgageBalance);
+    const bufferOk = estimatedValue >= required;
+    const kycPassed = req.user!.kycStatus === "PASSED";
+    const openClaim = await prisma.claim.findFirst({
+      where: { status: "OPEN", property: { ownerId: req.user!.id, peril } },
+    });
+    const hasOpenClaim = Boolean(openClaim);
+
+    const property = await prisma.property.create({
+      data: {
+        ownerId: req.user!.id,
+        address,
+        city: place.city,
+        county: place.county,
+        state: place.state,
+        zip: place.zip,
+        lat: place.lat,
+        lng: place.lng,
+        estimatedValueCents: estimatedValue,
+        peril,
+        mortgage: {
+          create: {
+            lenderName,
+            servicer: servicer || null,
+            outstandingBalanceCents: mortgageBalance,
+            lenderEmail: lenderEmail || null,
+          },
+        },
+      },
+    });
+
+    const deed = req.file;
+    if (deed) {
+      const key = safeKey(["properties", property.id, "deed", deed.originalname]);
+      await putObject({
+        key,
+        body: deed.buffer,
+        mimeType: deed.mimetype || "application/octet-stream",
+      });
+      await prisma.document.create({
+        data: {
+          kind: "DEED",
+          filename: deed.originalname,
+          storageKey: key,
+          mimeType: deed.mimetype || "application/octet-stream",
+          propertyId: property.id,
+          uploadedById: req.user!.id,
+        },
+      });
+    }
+
+    await prisma.eligibilityCheck.create({
+      data: {
+        propertyId: property.id,
+        bufferPassed: bufferOk,
+        kycPassed,
+        sameRiskCovered,
+        inRiskZone: true,
+        openClaim: hasOpenClaim,
+        requiredCoverageCents: required,
+        proposedCoverageCents: estimatedValue,
+        notes: hasOpenClaim
+          ? "Failed: an open claim exists on another property for this peril."
+          : bufferOk
+            ? "Submission buffer used estimated value vs mortgage × 1.35. Quote coverage will be re-checked."
+            : `Failed 35% buffer: estimated value below required ${required} cents.`,
+      },
+    });
+
+    if (!bufferOk || sameRiskCovered || !kycPassed || hasOpenClaim) {
+      res.status(201).json({ propertyId: property.id, eligibility: "fail" });
+      return;
+    }
+
+    const product = await prisma.carrierProduct.findFirst({
+      where: { peril, active: true },
+    });
+    if (!product) {
+      res.status(400).json({ error: "No carrier product is listed for that peril yet." });
+      return;
+    }
+
+    const pack = {
+      propertyId: property.id,
+      address: `${address}, ${place.city}, ${place.state} ${place.zip}`,
+      peril,
+      mortgageBalance,
+      estimatedValue,
+      ownerDays,
+      productId: product.id,
+    };
+    const key = safeKey(["properties", property.id, "filepack.json"]);
+    await putObject({
+      key,
+      body: Buffer.from(JSON.stringify(pack, null, 2)),
+      mimeType: "application/json",
+    });
+    await prisma.document.create({
+      data: {
+        kind: "FILE_PACK",
+        filename: "submission-pack.json",
+        storageKey: key,
+        mimeType: "application/json",
+        propertyId: property.id,
+        uploadedById: req.user!.id,
+      },
+    });
+    await prisma.quoteRequest.create({
+      data: {
+        propertyId: property.id,
+        carrierProductId: product.id,
+        filePackKey: key,
+      },
+    });
+
+    res.status(201).json({ propertyId: property.id, eligibility: "pass" });
+  }),
+);
