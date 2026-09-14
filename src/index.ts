@@ -15,6 +15,7 @@ import { claimsRouter } from "./routes/claims.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { carrierProductsRouter } from "./routes/carrier-products.js";
 import { organizationsRouter } from "./routes/organizations.js";
+import { invitesRouter } from "./routes/invites.js";
 import { loadSession } from "./middleware/auth.js";
 import { startSchedulers } from "./lib/scheduler.js";
 
@@ -49,6 +50,7 @@ app.use("/claims", claimsRouter);
 app.use("/notifications", notificationsRouter);
 app.use("/carrier-products", carrierProductsRouter);
 app.use("/organizations", organizationsRouter);
+app.use("/invites", invitesRouter);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);

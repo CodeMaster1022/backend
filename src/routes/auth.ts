@@ -1,24 +1,13 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import crypto from "node:crypto";
 import { prisma } from "../lib/db.js";
 import { COOKIE, requireAuth, wrap } from "../middleware/auth.js";
 import { publicUser } from "../lib/serialize.js";
 import { flags } from "../lib/flags.js";
 import { failKycAndRefund } from "../lib/kyc.js";
+import { issueSession, sessionCookieOptions } from "../lib/session.js";
 
 export const authRouter = Router();
-
-function cookieOptions() {
-  const days = Number(process.env.SESSION_DAYS ?? 7);
-  return {
-    httpOnly: true,
-    sameSite: "lax" as const,
-    secure: false,
-    path: "/",
-    maxAge: days * 24 * 60 * 60 * 1000,
-  };
-}
 
 authRouter.post(
   "/login",
@@ -35,13 +24,8 @@ authRouter.post(
       res.status(401).json({ error: "Email or password is incorrect." });
       return;
     }
-    const sessionToken = crypto.randomBytes(32).toString("hex");
-    const expires = new Date();
-    expires.setDate(expires.getDate() + Number(process.env.SESSION_DAYS ?? 7));
-    await prisma.session.create({
-      data: { sessionToken, userId: user.id, expires },
-    });
-    res.cookie(COOKIE, sessionToken, cookieOptions());
+    const sessionToken = await issueSession(user.id);
+    res.cookie(COOKIE, sessionToken, sessionCookieOptions());
     res.json({ user: publicUser(user) });
   }),
 );

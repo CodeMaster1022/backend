@@ -525,7 +525,23 @@ model WaitlistSignup {
   email              String
   role               WaitlistRole
   disclosureAccepted Boolean
+  invitedAt          DateTime?
   createdAt          DateTime     @default(now())
 
   @@unique([email, role])
+}
+
+model Invite {
+  id               String    @id @default(cuid()) @map("_id")
+  token            String    @unique
+  email            String
+  name             String
+  role             Role
+  organizationId   String?
+  waitlistSignupId String?
+  expiresAt        DateTime
+  usedAt           DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([email])
 }
