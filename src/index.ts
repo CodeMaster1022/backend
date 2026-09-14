@@ -20,11 +20,17 @@ import { loadSession } from "./middleware/auth.js";
 import { startSchedulers } from "./lib/scheduler.js";
 
 const app = express();
-const origin = process.env.UI_ORIGIN ?? "http://localhost:3000";
+// UI_ORIGIN accepts a comma-separated list, so a deployed frontend (e.g. a
+// Vercel URL) and localhost can both be allowed at once during a staged rollout.
+const allowedOrigins = (process.env.UI_ORIGIN ?? "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean)
+  .concat(["http://127.0.0.1:3000"]);
 
 app.use(
   cors({
-    origin: [origin, "http://127.0.0.1:3000"],
+    origin: allowedOrigins,
     credentials: true,
   }),
 );

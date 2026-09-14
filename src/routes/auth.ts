@@ -37,7 +37,8 @@ authRouter.post(
     if (token) {
       await prisma.session.deleteMany({ where: { sessionToken: token } });
     }
-    res.clearCookie(COOKIE, { path: "/" });
+    const { maxAge: _maxAge, ...clearOptions } = sessionCookieOptions();
+    res.clearCookie(COOKIE, clearOptions);
     res.json({ ok: true });
   }),
 );
