@@ -113,6 +113,8 @@ enum NotificationKind {
   CLAIM_OPENED
   CLAIM_SETTLED
   KYC_FAILED
+  LISTING_FULLY_FUNDED
+  POLICY_BOUND
 }
 
 enum DocumentKind {

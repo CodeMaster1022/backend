@@ -5,7 +5,7 @@ import { Peril } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
 import { PRESETS } from "../lib/presets.js";
-import { dollarsToCents, requiredCoverageCents } from "../lib/money.js";
+import { dollarsToCents, requiredCoverageCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
 
 export const propertiesRouter = Router();
@@ -124,7 +124,7 @@ propertiesRouter.post(
         proposedCoverageCents: proposedCoverage,
         notes: bufferOk
           ? "Annual re-verification: 35% equity buffer still satisfied."
-          : `Annual re-verification FAILED: coverage ${proposedCoverage} cents is below required ${required} cents (mortgage × 1.35). Listing should be suspended pending re-qualification.`,
+          : `Annual re-verification FAILED: coverage ${usd(proposedCoverage)} is below required ${usd(required)} (mortgage × 1.35). Listing should be suspended pending re-qualification.`,
       },
     });
 
@@ -236,7 +236,7 @@ propertiesRouter.post(
           ? "Failed: an open claim exists on another property for this peril."
           : bufferOk
             ? "Submission buffer used estimated value vs mortgage × 1.35. Quote coverage will be re-checked."
-            : `Failed 35% buffer: estimated value below required ${required} cents.`,
+            : `Failed 35% buffer: estimated value below required coverage of ${usd(required)}.`,
       },
     });
 
@@ -245,24 +245,101 @@ propertiesRouter.post(
       return;
     }
 
-    const product = await prisma.carrierProduct.findFirst({
-      where: { peril, active: true },
+    // Carrier/product selection is now a separate owner-facing step (see
+    // GET /:id/products and POST /:id/request-quote below) instead of
+    // auto-matching to whichever product happens to be active for the peril —
+    // owners should see and choose from a real marketplace of carrier products,
+    // matching the BRD §2.1 carrier-marketplace flow.
+    res.status(201).json({ propertyId: property.id, eligibility: "pass" });
+  }),
+);
+
+propertiesRouter.get(
+  "/:id/products",
+  requireAuth,
+  wrap(async (req, res) => {
+    const property = await prisma.property.findUnique({ where: { id: req.params.id as string } });
+    if (!property) {
+      res.status(404).json({ error: "Property not found." });
+      return;
+    }
+    if (property.ownerId !== req.user!.id && req.user!.role !== "ADMIN") {
+      res.status(403).json({ error: "Not allowed." });
+      return;
+    }
+    const products = await prisma.carrierProduct.findMany({
+      where: { peril: property.peril, active: true },
+      include: { carrier: { select: { name: true } } },
+      orderBy: { name: "asc" },
     });
-    if (!product) {
-      res.status(400).json({ error: "No carrier product is listed for that peril yet." });
+    res.json({ products });
+  }),
+);
+
+propertiesRouter.post(
+  "/:id/request-quote",
+  requireAuth,
+  wrap(async (req, res) => {
+    const propertyId = req.params.id as string;
+    const carrierProductId = String(req.body?.carrierProductId ?? "");
+    if (!carrierProductId) {
+      res.status(400).json({ error: "Select a carrier product." });
+      return;
+    }
+
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      include: {
+        eligibility: { orderBy: { checkedAt: "desc" }, take: 1 },
+        mortgage: true,
+      },
+    });
+    if (!property) {
+      res.status(404).json({ error: "Property not found." });
+      return;
+    }
+    if (property.ownerId !== req.user!.id && req.user!.role !== "ADMIN") {
+      res.status(403).json({ error: "Not allowed." });
+      return;
+    }
+    const latestCheck = property.eligibility[0];
+    if (
+      !latestCheck ||
+      !latestCheck.bufferPassed ||
+      latestCheck.sameRiskCovered ||
+      !latestCheck.kycPassed ||
+      latestCheck.openClaim
+    ) {
+      res.status(400).json({ error: "This property is not currently eligible for a quote." });
+      return;
+    }
+
+    const existingActive = await prisma.quoteRequest.findFirst({
+      where: { propertyId, status: { in: ["PENDING", "ACCEPTED"] } },
+      include: { carrierProduct: { select: { name: true } } },
+    });
+    if (existingActive) {
+      res.status(400).json({
+        error: `A quote request is already ${existingActive.status.toLowerCase()} with ${existingActive.carrierProduct.name}.`,
+      });
+      return;
+    }
+
+    const product = await prisma.carrierProduct.findUnique({ where: { id: carrierProductId } });
+    if (!product || !product.active || product.peril !== property.peril) {
+      res.status(400).json({ error: "That product is not available for this property." });
       return;
     }
 
     const pack = {
       propertyId: property.id,
-      address: `${address}, ${place.city}, ${place.state} ${place.zip}`,
-      peril,
-      mortgageBalance,
-      estimatedValue,
-      ownerDays,
+      address: `${property.address}, ${property.city}, ${property.state} ${property.zip}`,
+      peril: property.peril,
+      mortgageBalance: property.mortgage?.outstandingBalanceCents ?? 0,
+      estimatedValue: property.estimatedValueCents,
       productId: product.id,
     };
-    const key = safeKey(["properties", property.id, "filepack.json"]);
+    const key = safeKey(["properties", property.id, `filepack-${Date.now()}.json`]);
     await putObject({
       key,
       body: Buffer.from(JSON.stringify(pack, null, 2)),
@@ -278,7 +355,7 @@ propertiesRouter.post(
         uploadedById: req.user!.id,
       },
     });
-    await prisma.quoteRequest.create({
+    const quoteRequest = await prisma.quoteRequest.create({
       data: {
         propertyId: property.id,
         carrierProductId: product.id,
@@ -286,6 +363,6 @@ propertiesRouter.post(
       },
     });
 
-    res.status(201).json({ propertyId: property.id, eligibility: "pass" });
+    res.status(201).json({ quoteRequestId: quoteRequest.id });
   }),
 );

@@ -9,6 +9,7 @@ import {
   listingWindow,
   minimumPayableCents,
   requiredCoverageCents,
+  usd,
 } from "../lib/money.js";
 
 export const quotesRouter = Router();
@@ -108,7 +109,10 @@ quotesRouter.post(
     const required = requiredCoverageCents(mortgageCents);
     if (!bufferPassed(minPayable, mortgageCents)) {
       res.status(400).json({
-        error: `Coverage fails the 35% buffer. Minimum payable is below mortgage × 1.35 (${required} cents).`,
+        error:
+          request.carrierProduct.payoutSchedule
+            ? `Coverage fails the 35% buffer. This product's payout schedule caps the minimum payable at ${usd(minPayable)} for ${usd(coverageCents)} of stated coverage — that must be at least ${usd(required)} (mortgage × 1.35). Raise the coverage amount so the minimum payable band clears the threshold.`
+            : `Coverage fails the 35% buffer. ${usd(coverageCents)} of coverage is below the required ${usd(required)} (mortgage × 1.35).`,
       });
       return;
     }

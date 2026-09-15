@@ -9,6 +9,7 @@ import { canCollectMoney, flags } from "../lib/flags.js";
 import { platformFeeCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
 import { radiusKmForPeril } from "../lib/labels.js";
+import { notifyListingParties } from "../lib/notify.js";
 
 export const listingsRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12_000_000 } });
@@ -164,7 +165,11 @@ listingsRouter.post(
 
     const listing = await prisma.listing.findUnique({
       where: { id: listingId },
-      include: { property: { include: { mortgage: true } } },
+      include: {
+        property: { include: { mortgage: true } },
+        contributions: { where: { status: "SUCCEEDED" }, select: { userId: true } },
+        quote: { include: { quoteRequest: { include: { carrierProduct: { select: { carrierId: true } } } } } },
+      },
     });
     if (!listing) {
       res.status(404).json({ error: "Listing not found." });
@@ -182,7 +187,11 @@ listingsRouter.post(
         res.status(403).json({ error: "Only the named owner can fund the 15% minimum." });
         return;
       }
-      if (listing.status !== "AWAITING_OWNER_FUNDS" && listing.status !== "TOPUP_WINDOW") {
+      if (
+        listing.status !== "AWAITING_OWNER_FUNDS" &&
+        listing.status !== "TOPUP_WINDOW" &&
+        listing.status !== "LIVE"
+      ) {
         res.status(400).json({ error: "Owner funds are not being accepted on this listing." });
         return;
       }
@@ -245,10 +254,11 @@ listingsRouter.post(
     if (asOwner && nextOwner >= minOwner && listing.status === "AWAITING_OWNER_FUNDS") {
       nextStatus = "LIVE";
     }
-    if (asOwner && listing.status === "TOPUP_WINDOW" && fullyFunded) {
-      nextStatus = "FULLY_FUNDED";
-    }
-    if (!asOwner && fullyFunded) {
+    // Owners can keep contributing beyond the 15% minimum while a listing is
+    // Live (or during a top-up window) — if that contribution is the one that
+    // completes funding, it must flip straight to FULLY_FUNDED regardless of
+    // whether it was the owner or a funder who closed the gap.
+    if (fullyFunded && (nextStatus === "LIVE" || nextStatus === "TOPUP_WINDOW")) {
       nextStatus = "FULLY_FUNDED";
     }
 
@@ -294,7 +304,55 @@ listingsRouter.post(
       }
     }, TX_OPTIONS);
 
+    // listing.status can never already be FULLY_FUNDED here — every path above
+    // (owner and funder alike) rejects a contribution unless the listing was
+    // AWAITING_OWNER_FUNDS, TOPUP_WINDOW, or LIVE, so nextStatus === FULLY_FUNDED
+    // always means this contribution is the one that just completed funding.
+    if (nextStatus === "FULLY_FUNDED") {
+      const contributorIds = new Set(listing.contributions.map((c) => c.userId));
+      contributorIds.add(req.user!.id);
+      await notifyListingParties({
+        listingId,
+        ownerId: listing.property.ownerId,
+        contributorUserIds: Array.from(contributorIds),
+        carrierId: listing.quote.quoteRequest.carrierProduct.carrierId,
+        kind: "LISTING_FULLY_FUNDED",
+        title: "Listing fully funded",
+        body: `${listing.property.address}, ${listing.property.city} has reached 100% of its premium target and is ready to bind.`,
+      });
+    }
+
     res.json({ ok: true, fullyFunded, status: nextStatus });
+  }),
+);
+
+const CANCELLABLE_STATUSES = ["AWAITING_OWNER_FUNDS", "LIVE", "TOPUP_WINDOW"] as const;
+
+listingsRouter.post(
+  "/:id/cancel",
+  requireAuth,
+  wrap(async (req, res) => {
+    const listingId = req.params.id as string;
+    const listing = await prisma.listing.findUnique({
+      where: { id: listingId },
+      include: { property: true },
+    });
+    if (!listing) {
+      res.status(404).json({ error: "Listing not found." });
+      return;
+    }
+    if (listing.property.ownerId !== req.user!.id && req.user!.role !== "ADMIN") {
+      res.status(403).json({ error: "Only the property owner can cancel this listing." });
+      return;
+    }
+    if (!CANCELLABLE_STATUSES.includes(listing.status as (typeof CANCELLABLE_STATUSES)[number])) {
+      res.status(400).json({
+        error: "This listing can no longer be cancelled — it's already fully funded or bound.",
+      });
+      return;
+    }
+    await refundListing(listingId, "Cancelled by property owner before full funding.");
+    res.json({ ok: true });
   }),
 );
 
@@ -340,6 +398,7 @@ listingsRouter.post(
       include: {
         property: { include: { mortgage: true, owner: true } },
         quote: { include: { quoteRequest: { include: { carrierProduct: true } } } },
+        contributions: { where: { status: "SUCCEEDED" }, select: { userId: true } },
       },
     });
     if (!listing) {
@@ -394,6 +453,7 @@ listingsRouter.post(
       mimeType: "text/plain",
     });
 
+    let boundPolicyId = "";
     await prisma.$transaction(async (tx) => {
       await tx.escrowLedger.create({
         data: {
@@ -429,6 +489,7 @@ listingsRouter.post(
           lenderNamedLossPayee: listing.lenderNamedLossPayee,
         },
       });
+      boundPolicyId = policy.id;
       await tx.triggerWatch.create({
         data: {
           policyId: policy.id,
@@ -443,6 +504,17 @@ listingsRouter.post(
         data: { status: "ACTIVE" },
       });
     }, TX_OPTIONS);
+
+    await notifyListingParties({
+      listingId: listing.id,
+      ownerId: listing.property.ownerId,
+      contributorUserIds: listing.contributions.map((c) => c.userId),
+      carrierId,
+      kind: "POLICY_BOUND",
+      title: "Policy bound",
+      body: `Policy ${policyNumber} is now active for ${listing.property.address}, ${listing.property.city}.`,
+      policyId: boundPolicyId,
+    });
 
     res.json({ ok: true, policyNumber });
   }),
