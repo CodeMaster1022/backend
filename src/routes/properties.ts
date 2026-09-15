@@ -1,10 +1,9 @@
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { Peril } from "@prisma/client";
+import { Peril, StateCode } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
-import { PRESETS } from "../lib/presets.js";
 import { dollarsToCents, requiredCoverageCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
 
@@ -13,7 +12,12 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8_0
 
 const submitPropertySchema = z.object({
   address: z.string().trim().min(1, "Address is required."),
-  preset: z.string().trim().min(1, "Select a market."),
+  city: z.string().trim().min(1, "City is required."),
+  county: z.string().trim().optional().default(""),
+  state: z.enum(["FL", "CA"], { message: "FiSure only covers Florida and California properties." }),
+  zip: z.string().trim().min(1, "ZIP code is required."),
+  lat: z.coerce.number(),
+  lng: z.coerce.number(),
   peril: z.enum(["FL_HURRICANE", "FL_FLOOD", "CA_WILDFIRE", "CA_EARTHQUAKE"], {
     message: "Select a covered peril.",
   }),
@@ -146,7 +150,6 @@ propertiesRouter.post(
     }
     const body = parsed.data;
     const address = body.address;
-    const preset = body.preset;
     const peril = body.peril as Peril;
     const mortgageBalance = dollarsToCents(body.mortgage);
     const estimatedValue = dollarsToCents(body.value);
@@ -155,19 +158,24 @@ propertiesRouter.post(
     const servicer = body.servicer;
     const sameRiskCovered = body.sameRiskCovered === "on" || body.sameRiskCovered === "true";
     const ownerDays = body.ownerDays;
-    const place = PRESETS[preset];
+    const place = {
+      city: body.city,
+      county: body.county || body.city,
+      state: body.state as StateCode,
+      zip: body.zip,
+      lat: body.lat,
+      lng: body.lng,
+    };
 
-    if (!place || estimatedValue <= 0) {
-      res.status(400).json({
-        error: "Select a valid market and enter an estimated value greater than zero.",
-      });
+    if (estimatedValue <= 0) {
+      res.status(400).json({ error: "Enter an estimated value greater than zero." });
       return;
     }
     if (
       (place.state === "FL" && !peril.startsWith("FL_")) ||
       (place.state === "CA" && !peril.startsWith("CA_"))
     ) {
-      res.status(400).json({ error: "Peril must match the launch market." });
+      res.status(400).json({ error: "Peril must match the property's state." });
       return;
     }
 
