@@ -1,7 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { Peril, StateCode } from "@prisma/client";
+import { Peril, PropertyType, StateCode } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
 import { dollarsToCents, requiredCoverageCents, usd } from "../lib/money.js";
@@ -21,6 +21,7 @@ const submitPropertySchema = z.object({
   peril: z.enum(["FL_HURRICANE", "FL_FLOOD", "CA_WILDFIRE", "CA_EARTHQUAKE"], {
     message: "Select a covered peril.",
   }),
+  propertyType: z.enum(["RESIDENTIAL", "COMMERCIAL"]).optional().default("RESIDENTIAL"),
   mortgage: z.string().trim().default("0"),
   value: z.string().trim().min(1, "Estimated value is required."),
   lenderName: z.string().trim().min(1, "Lender name is required."),
@@ -199,6 +200,7 @@ propertiesRouter.post(
         lng: place.lng,
         estimatedValueCents: estimatedValue,
         peril,
+        propertyType: body.propertyType as PropertyType,
         mortgage: {
           create: {
             lenderName,
@@ -276,7 +278,7 @@ propertiesRouter.get(
       return;
     }
     const products = await prisma.carrierProduct.findMany({
-      where: { peril: property.peril, active: true },
+      where: { peril: property.peril, propertyType: property.propertyType, active: true },
       include: { carrier: { select: { name: true } } },
       orderBy: { name: "asc" },
     });
@@ -334,7 +336,12 @@ propertiesRouter.post(
     }
 
     const product = await prisma.carrierProduct.findUnique({ where: { id: carrierProductId } });
-    if (!product || !product.active || product.peril !== property.peril) {
+    if (
+      !product ||
+      !product.active ||
+      product.peril !== property.peril ||
+      product.propertyType !== property.propertyType
+    ) {
       res.status(400).json({ error: "That product is not available for this property." });
       return;
     }

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { PrismaClient, Peril, Role, ListingStatus, type Prisma } from "@prisma/client";
+import { PrismaClient, Peril, PropertyType, Role, ListingStatus, type Prisma } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { putObject, safeKey } from "../src/lib/storage.js";
 import { radiusKmForPeril } from "../src/lib/labels.js";
@@ -84,8 +84,61 @@ async function main() {
     const row = await prisma.carrierProduct.create({
       data: { ...product, carrierId: carrier.id },
     });
-    productByPeril[product.peril] = row.id;
+    // First product per peril wins the demo-flow reference below — later
+    // marketplace-competitor products must not silently swap out the product
+    // that existing seeded listings/quotes already reference.
+    if (!productByPeril[product.peril]) productByPeril[product.peril] = row.id;
   }
+
+  // A few competing named products so the owner-facing marketplace picker has
+  // more than one option per peril to choose between, per client feedback
+  // ("Arbol – Residential Hurricane Coverage", "Marsh – Corporate Hurricane
+  // Coverage", "Descartes – Corporate Flood Coverage" were the client's own
+  // example names — used here as illustrative pilot data pending real carrier
+  // onboarding).
+  const arbol = await prisma.carrier.create({
+    data: { id: "carrier-arbol", name: "Arbol", slug: "arbol" },
+  });
+  const marsh = await prisma.carrier.create({
+    data: { id: "carrier-marsh", name: "Marsh", slug: "marsh" },
+  });
+  const descartes = await prisma.carrier.create({
+    data: { id: "carrier-descartes", name: "Descartes", slug: "descartes" },
+  });
+  await prisma.carrierProduct.createMany({
+    data: [
+      {
+        carrierId: arbol.id,
+        name: "Residential Hurricane Coverage",
+        peril: Peril.FL_HURRICANE,
+        propertyType: PropertyType.RESIDENTIAL,
+        states: "FL",
+        triggerDescription:
+          "Category 3 or higher hurricane landfall confirmed by NOAA NHC within a 50 km radius of the property.",
+        payoutSchedule: { bands: [{ pct: 40 }, { pct: 70 }, { pct: 100 }] },
+      },
+      {
+        carrierId: marsh.id,
+        name: "Corporate Hurricane Coverage",
+        peril: Peril.FL_HURRICANE,
+        propertyType: PropertyType.COMMERCIAL,
+        states: "FL",
+        triggerDescription:
+          "Category 3 or higher hurricane landfall confirmed by NOAA NHC within a 50 km radius of the property.",
+        payoutSchedule: { bands: [{ pct: 50 }, { pct: 100 }] },
+      },
+      {
+        carrierId: descartes.id,
+        name: "Corporate Flood Coverage",
+        peril: Peril.FL_FLOOD,
+        propertyType: PropertyType.COMMERCIAL,
+        states: "FL",
+        triggerDescription:
+          "FEMA-declared flood event reaching a defined water-level threshold at or near the property.",
+        payoutSchedule: { bands: [{ pct: 100 }] },
+      },
+    ],
+  });
 
   const org = await prisma.organization.create({
     data: { id: "seed-csr-org", name: "Harbor CSR", approved: true },

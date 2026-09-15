@@ -9,6 +9,7 @@ import {
   listingWindow,
   minimumPayableCents,
   requiredCoverageCents,
+  suggestedMinimumCoverageCents,
   usd,
 } from "../lib/money.js";
 
@@ -108,12 +109,21 @@ quotesRouter.post(
     );
     const required = requiredCoverageCents(mortgageCents);
     if (!bufferPassed(minPayable, mortgageCents)) {
-      res.status(400).json({
-        error:
-          request.carrierProduct.payoutSchedule
-            ? `Coverage fails the 35% buffer. This product's payout schedule caps the minimum payable at ${usd(minPayable)} for ${usd(coverageCents)} of stated coverage — that must be at least ${usd(required)} (mortgage × 1.35). Raise the coverage amount so the minimum payable band clears the threshold.`
-            : `Coverage fails the 35% buffer. ${usd(coverageCents)} of coverage is below the required ${usd(required)} (mortgage × 1.35).`,
-      });
+      let error: string;
+      if (!request.carrierProduct.payoutSchedule) {
+        error = `Coverage fails the 35% buffer. ${usd(coverageCents)} of coverage is below the required ${usd(required)} (mortgage × 1.35).`;
+      } else {
+        const suggestion = suggestedMinimumCoverageCents(
+          mortgageCents,
+          request.carrierProduct.payoutSchedule,
+        );
+        error = `Coverage fails the 35% buffer. This product's payout schedule caps the minimum payable at ${usd(minPayable)} for ${usd(coverageCents)} of stated coverage — that must be at least ${usd(required)} (mortgage × 1.35). ${
+          suggestion.achievable
+            ? `Enter at least ${usd(suggestion.coverageCents)} of coverage to clear the minimum payable band.`
+            : "This product's payout schedule cannot clear the required buffer at any coverage amount — a fixed-dollar band is set below the required minimum."
+        }`;
+      }
+      res.status(400).json({ error });
       return;
     }
 

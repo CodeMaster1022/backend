@@ -37,6 +37,35 @@ export function minimumPayableCents(
   return Math.min(...values);
 }
 
+/**
+ * The smallest stated coverage that clears the 35% buffer once the product's
+ * payout schedule is applied — i.e. the number a carrier should actually type
+ * into "Coverage (USD)", since the raw 135%-of-mortgage figure only clears
+ * the buffer when every band pays out 100%.
+ */
+export function suggestedMinimumCoverageCents(
+  mortgageCents: number,
+  payoutSchedule: unknown,
+): { coverageCents: number; achievable: boolean } {
+  const required = requiredCoverageCents(mortgageCents);
+  if (!payoutSchedule || typeof payoutSchedule !== "object") {
+    return { coverageCents: required, achievable: true };
+  }
+  const record = payoutSchedule as { bands?: Array<{ pct?: number; cents?: number }> };
+  const bands = record.bands;
+  if (!bands?.length) return { coverageCents: required, achievable: true };
+
+  let coverageCents = required;
+  for (const band of bands) {
+    if (typeof band.cents === "number") {
+      if (band.cents < required) return { coverageCents: required, achievable: false };
+    } else if (typeof band.pct === "number" && band.pct > 0) {
+      coverageCents = Math.max(coverageCents, Math.ceil((required * 100) / band.pct));
+    }
+  }
+  return { coverageCents, achievable: true };
+}
+
 export function platformFeeBps(premiumCents: number) {
   if (premiumCents <= 100_000) return 2000;
   if (premiumCents < 800_000) return 1500;

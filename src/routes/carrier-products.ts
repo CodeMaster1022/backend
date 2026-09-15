@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { Peril, type Prisma } from "@prisma/client";
+import { Peril, PropertyType, type Prisma } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 
@@ -11,6 +11,7 @@ const productSchema = z.object({
   peril: z.enum(["FL_HURRICANE", "FL_FLOOD", "CA_WILDFIRE", "CA_EARTHQUAKE"], {
     message: "Select a covered peril.",
   }),
+  propertyType: z.enum(["RESIDENTIAL", "COMMERCIAL"]).optional().default("RESIDENTIAL"),
   states: z.string().trim().min(1, "States are required (e.g. FL or CA)."),
   triggerDescription: z.string().trim().min(1, "Trigger description is required."),
   payoutSchedule: z.string().trim().optional().default(""),
@@ -72,6 +73,7 @@ carrierProductsRouter.post(
         carrierId,
         name: parsed.data.name,
         peril: parsed.data.peril as Peril,
+        propertyType: parsed.data.propertyType as PropertyType,
         states: parsed.data.states,
         triggerDescription: parsed.data.triggerDescription,
         payoutSchedule: payoutSchedule ?? undefined,
@@ -114,6 +116,9 @@ carrierProductsRouter.patch(
       data: {
         ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}),
         ...(parsed.data.peril !== undefined ? { peril: parsed.data.peril as Peril } : {}),
+        ...(parsed.data.propertyType !== undefined
+          ? { propertyType: parsed.data.propertyType as PropertyType }
+          : {}),
         ...(parsed.data.states !== undefined ? { states: parsed.data.states } : {}),
         ...(parsed.data.triggerDescription !== undefined
           ? { triggerDescription: parsed.data.triggerDescription }

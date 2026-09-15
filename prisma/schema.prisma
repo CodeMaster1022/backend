@@ -38,6 +38,11 @@ enum StateCode {
   CA
 }
 
+enum PropertyType {
+  RESIDENTIAL
+  COMMERCIAL
+}
+
 enum Peril {
   FL_HURRICANE
   FL_FLOOD
@@ -218,14 +223,15 @@ model Carrier {
 }
 
 model CarrierProduct {
-  id                 String  @id @default(cuid()) @map("_id")
+  id                 String       @id @default(cuid()) @map("_id")
   carrierId          String
   name               String
   peril              Peril
+  propertyType       PropertyType @default(RESIDENTIAL)
   states             String
   triggerDescription String
   payoutSchedule     Json?
-  active             Boolean @default(true)
+  active             Boolean      @default(true)
 
   carrier       Carrier        @relation(fields: [carrierId], references: [id])
   quoteRequests QuoteRequest[]
@@ -234,7 +240,7 @@ model CarrierProduct {
 }
 
 model Property {
-  id                  String    @id @default(cuid()) @map("_id")
+  id                  String       @id @default(cuid()) @map("_id")
   ownerId             String
   address             String
   city                String
@@ -245,8 +251,9 @@ model Property {
   lng                 Float
   estimatedValueCents Int
   peril               Peril
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  propertyType        PropertyType @default(RESIDENTIAL)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
 
   owner         User               @relation(fields: [ownerId], references: [id])
   mortgage      Mortgage?
