@@ -1,7 +1,6 @@
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
-import type { ListingStatus } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
 import { DISCLOSURE_VERSION, DISCLOSURE_TEXT, assertSafeCopy } from "../lib/copy.js";
@@ -10,6 +9,9 @@ import { platformFeeCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
 import { radiusKmForPeril } from "../lib/labels.js";
 import { notifyListingParties } from "../lib/notify.js";
+import { loadAndValidateContribution, finalizeContribution } from "../lib/contributions.js";
+import { stripe } from "../lib/stripe.js";
+import { isAllowedReturnUrl, firstAllowedOrigin } from "../lib/origins.js";
 
 export const listingsRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12_000_000 } });
@@ -17,6 +19,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12_
 const contributeSchema = z.object({
   amount: z.coerce.number().positive("Enter a contribution amount."),
   asOwner: z.union([z.boolean(), z.string()]).optional().default(false),
+  returnUrl: z.string().trim().optional(),
 });
 
 const listingInclude = {
@@ -149,10 +152,6 @@ listingsRouter.post(
       res.status(400).json({ error: "Collections are flagged off." });
       return;
     }
-    if (flags.paymentsEnabled) {
-      res.status(400).json({ error: "Live payments are off in this mock build." });
-      return;
-    }
 
     const listingId = req.params.id as string;
     const parsedBody = contributeSchema.safeParse(req.body);
@@ -163,166 +162,71 @@ listingsRouter.post(
     const amountCents = Math.round(parsedBody.data.amount * 100);
     const asOwner = parsedBody.data.asOwner === true || parsedBody.data.asOwner === "on";
 
-    const listing = await prisma.listing.findUnique({
-      where: { id: listingId },
-      include: {
-        property: { include: { mortgage: true } },
-        contributions: { where: { status: "SUCCEEDED" }, select: { userId: true } },
-        quote: { include: { quoteRequest: { include: { carrierProduct: { select: { carrierId: true } } } } } },
-      },
+    const check = await loadAndValidateContribution({
+      listingId,
+      userId: req.user!.id,
+      userRole: req.user!.role,
+      amountCents,
+      asOwner,
     });
-    if (!listing) {
-      res.status(404).json({ error: "Listing not found." });
+    if (!check.ok) {
+      res.status(400).json({ error: check.error });
       return;
     }
+    const listing = check.listing;
 
-    const remaining = listing.premiumTargetCents - listing.fundedCents;
-    if (amountCents > remaining) {
-      res.status(400).json({ error: "That amount exceeds the remaining premium." });
-      return;
-    }
-
-    if (asOwner) {
-      if (listing.property.ownerId !== req.user!.id && req.user!.role !== "ADMIN") {
-        res.status(403).json({ error: "Only the named owner can fund the 15% minimum." });
+    if (flags.paymentsEnabled) {
+      if (!stripe) {
+        res.status(500).json({ error: "Payments are enabled but Stripe is not configured." });
         return;
       }
-      if (
-        listing.status !== "AWAITING_OWNER_FUNDS" &&
-        listing.status !== "TOPUP_WINDOW" &&
-        listing.status !== "LIVE"
-      ) {
-        res.status(400).json({ error: "Owner funds are not being accepted on this listing." });
-        return;
-      }
-      const minimum = Math.ceil(listing.premiumTargetCents * 0.15);
-      const nextOwner = listing.ownerContributionCents + amountCents;
-      if (
-        listing.status === "AWAITING_OWNER_FUNDS" &&
-        nextOwner < minimum &&
-        amountCents < remaining
-      ) {
-        res.status(400).json({
-          error: "Owner must reach at least 15% of premium before the listing goes live.",
-        });
-        return;
-      }
-    } else {
-      if (req.user!.role !== "FUNDER" && req.user!.role !== "ADMIN") {
-        res.status(403).json({ error: "Corporate program accounts contribute here." });
-        return;
-      }
-      if (!flags.contributionsPublic && req.user!.role === "FUNDER") {
-        const membership = await prisma.membership.findFirst({
-          where: { userId: req.user!.id, organization: { approved: true } },
-        });
-        if (!membership) {
-          res.status(403).json({ error: "Your organization is not yet approved for the closed pilot." });
-          return;
-        }
-      }
-      const disclosure = await prisma.disclosureAcceptance.findFirst({
-        where: { userId: req.user!.id, version: DISCLOSURE_VERSION },
-      });
-      if (!disclosure) {
-        res.status(400).json({ error: "Accept the risk disclosure before contributing." });
-        return;
-      }
-      if (listing.status !== "LIVE") {
-        res.status(400).json({ error: "This listing is not open for contributions." });
-        return;
-      }
-    }
-
-    if (listing.expiresAt && listing.expiresAt < new Date() && listing.status === "LIVE") {
-      res.status(400).json({ error: "This listing has reached its deadline." });
-      return;
-    }
-
-    const membership = await prisma.membership.findFirst({
-      where: { userId: req.user!.id },
-    });
-
-    const nextFunded = listing.fundedCents + amountCents;
-    const nextOwner = asOwner
-      ? listing.ownerContributionCents + amountCents
-      : listing.ownerContributionCents;
-    const fullyFunded = nextFunded >= listing.premiumTargetCents;
-    const minOwner = Math.ceil(listing.premiumTargetCents * 0.15);
-
-    let nextStatus: ListingStatus = listing.status;
-    if (asOwner && nextOwner >= minOwner && listing.status === "AWAITING_OWNER_FUNDS") {
-      nextStatus = "LIVE";
-    }
-    // Owners can keep contributing beyond the 15% minimum while a listing is
-    // Live (or during a top-up window) — if that contribution is the one that
-    // completes funding, it must flip straight to FULLY_FUNDED regardless of
-    // whether it was the owner or a funder who closed the gap.
-    if (fullyFunded && (nextStatus === "LIVE" || nextStatus === "TOPUP_WINDOW")) {
-      nextStatus = "FULLY_FUNDED";
-    }
-
-    const justWentLive = nextStatus === "LIVE" && listing.status !== "LIVE";
-    const hasMortgage = Boolean(listing.property.mortgage);
-
-    await prisma.$transaction(async (tx) => {
-      await tx.contribution.create({
-        data: {
+      const returnUrl =
+        parsedBody.data.returnUrl && isAllowedReturnUrl(parsedBody.data.returnUrl)
+          ? parsedBody.data.returnUrl
+          : `${firstAllowedOrigin()}/app`;
+      const separator = returnUrl.includes("?") ? "&" : "?";
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: `Premium contribution — ${listing.property.address}, ${listing.property.city}`,
+              },
+              unit_amount: amountCents,
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${returnUrl}${separator}checkout=success`,
+        cancel_url: `${returnUrl}${separator}checkout=cancelled`,
+        client_reference_id: req.user!.id,
+        metadata: {
           listingId,
           userId: req.user!.id,
-          organizationId: asOwner ? null : membership?.organizationId,
-          amountCents,
-          status: "SUCCEEDED",
+          asOwner: String(asOwner),
         },
       });
-      await tx.escrowLedger.create({
-        data: {
-          listingId,
-          type: asOwner ? "OWNER_PREMIUM" : "FUNDER_PREMIUM",
-          amountCents,
-          partyUserId: req.user!.id,
-          note: "simulated collection",
-        },
-      });
-      await tx.listing.update({
-        where: { id: listingId },
-        data: {
-          fundedCents: nextFunded,
-          ownerContributionCents: nextOwner,
-          status: nextStatus,
-          liveAt: nextStatus === "LIVE" && !listing.liveAt ? new Date() : listing.liveAt,
-          ...(justWentLive && hasMortgage ? { lenderNamedLossPayee: true } : {}),
-        },
-      });
-      // Lender is automatically named loss payee and notified the moment a
-      // listing goes live, per BRD §2.3/§8.2 — not a manual admin step.
-      if (justWentLive && hasMortgage) {
-        await tx.mortgage.update({
-          where: { propertyId: listing.propertyId },
-          data: { notifiedAt: new Date() },
-        });
-      }
-    }, TX_OPTIONS);
-
-    // listing.status can never already be FULLY_FUNDED here — every path above
-    // (owner and funder alike) rejects a contribution unless the listing was
-    // AWAITING_OWNER_FUNDS, TOPUP_WINDOW, or LIVE, so nextStatus === FULLY_FUNDED
-    // always means this contribution is the one that just completed funding.
-    if (nextStatus === "FULLY_FUNDED") {
-      const contributorIds = new Set(listing.contributions.map((c) => c.userId));
-      contributorIds.add(req.user!.id);
-      await notifyListingParties({
-        listingId,
-        ownerId: listing.property.ownerId,
-        contributorUserIds: Array.from(contributorIds),
-        carrierId: listing.quote.quoteRequest.carrierProduct.carrierId,
-        kind: "LISTING_FULLY_FUNDED",
-        title: "Listing fully funded",
-        body: `${listing.property.address}, ${listing.property.city} has reached 100% of its premium target and is ready to bind.`,
-      });
+      res.json({ checkoutUrl: session.url });
+      return;
     }
 
-    res.json({ ok: true, fullyFunded, status: nextStatus });
+    const result = await finalizeContribution({
+      listingId,
+      userId: req.user!.id,
+      userRole: req.user!.role,
+      amountCents,
+      asOwner,
+      stripePaymentIntentId: null,
+      note: "simulated collection",
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json({ ok: true, fullyFunded: result.fullyFunded, status: result.status });
   }),
 );
 

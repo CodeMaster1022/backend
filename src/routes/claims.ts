@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
+import { sendNotificationEmails } from "../lib/notify.js";
 
 export const claimsRouter = Router();
 
@@ -56,16 +57,19 @@ claimsRouter.post(
         description: parsed.data.description || null,
       },
     });
+    const claimOpenedTitle = "A claim was opened on your policy";
+    const claimOpenedBody = `Policy ${policy.policyNumber} now has an open claim. New listings for the same peril are blocked until it's settled.`;
     await prisma.notification.create({
       data: {
         userId: policy.listing.property.ownerId,
         kind: "CLAIM_OPENED",
-        title: "A claim was opened on your policy",
-        body: `Policy ${policy.policyNumber} now has an open claim. New listings for the same peril are blocked until it's settled.`,
+        title: claimOpenedTitle,
+        body: claimOpenedBody,
         listingId: policy.listingId,
         policyId: policy.id,
       },
     });
+    await sendNotificationEmails([policy.listing.property.ownerId], claimOpenedTitle, claimOpenedBody);
     res.status(201).json({ claim });
   }),
 );
@@ -92,16 +96,19 @@ claimsRouter.post(
       data: { status: "SETTLED", settledAt: new Date() },
     });
     if (claim.policy) {
+      const claimSettledTitle = "Your claim was settled";
+      const claimSettledBody = `Policy ${claim.policy.policyNumber}'s claim is now settled. You may list again for this peril.`;
       await prisma.notification.create({
         data: {
           userId: claim.policy.listing.property.ownerId,
           kind: "CLAIM_SETTLED",
-          title: "Your claim was settled",
-          body: `Policy ${claim.policy.policyNumber}'s claim is now settled. You may list again for this peril.`,
+          title: claimSettledTitle,
+          body: claimSettledBody,
           listingId: claim.policy.listingId,
           policyId: claim.policy.id,
         },
       });
+      await sendNotificationEmails([claim.policy.listing.property.ownerId], claimSettledTitle, claimSettledBody);
     }
     res.json({ claim: updated });
   }),

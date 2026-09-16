@@ -120,6 +120,7 @@ enum NotificationKind {
   KYC_FAILED
   LISTING_FULLY_FUNDED
   POLICY_BOUND
+  QUOTE_REQUEST_RECEIVED
 }
 
 enum DocumentKind {

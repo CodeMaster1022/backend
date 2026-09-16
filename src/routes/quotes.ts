@@ -36,7 +36,13 @@ quotesRouter.get(
           ? { carrierProduct: { carrierId: req.user!.carrierId } }
           : {},
       include: {
-        property: { include: { mortgage: true, owner: { select: { email: true, name: true } } } },
+        property: {
+          include: {
+            mortgage: true,
+            owner: { select: { email: true, name: true, kycStatus: true } },
+            documents: true,
+          },
+        },
         carrierProduct: true,
         quote: true,
       },

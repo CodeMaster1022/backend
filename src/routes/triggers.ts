@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 import { radiusKmForPeril } from "../lib/labels.js";
+import { sendNotificationEmails } from "../lib/notify.js";
 import type { Peril } from "@prisma/client";
 
 export const triggersRouter = Router();
@@ -49,6 +50,7 @@ async function notifyTriggerMatch(watch: {
       listingId: listing.id,
     })),
   });
+  await sendNotificationEmails(recipientIds, title, body);
 }
 
 async function evaluateEvents(

@@ -6,6 +6,7 @@ import { prisma } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
 import { dollarsToCents, requiredCoverageCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
+import { notifyCarrierNewQuoteRequest } from "../lib/notify.js";
 
 export const propertiesRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8_000_000 } });
@@ -376,6 +377,12 @@ propertiesRouter.post(
         carrierProductId: product.id,
         filePackKey: key,
       },
+    });
+
+    await notifyCarrierNewQuoteRequest({
+      carrierId: product.carrierId,
+      title: "New quote request",
+      body: `${property.address}, ${property.city} requested a quote for ${product.name}.`,
     });
 
     res.status(201).json({ quoteRequestId: quoteRequest.id });

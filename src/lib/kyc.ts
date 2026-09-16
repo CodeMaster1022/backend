@@ -1,6 +1,10 @@
 import { prisma, TX_OPTIONS } from "./db.js";
+import { sendNotificationEmails } from "./notify.js";
 
 const REFUNDABLE_STATUSES = ["ACTIVE", "BINDING"] as const;
+const KYC_FAILED_TITLE = "Identity check failed";
+const KYC_FAILED_BODY =
+  "Per platform policy, any escrowed contributions on not-yet-active listings were refunded in full.";
 
 export async function failKycAndRefund(userId: string) {
   await prisma.$transaction(async (tx) => {
@@ -9,8 +13,8 @@ export async function failKycAndRefund(userId: string) {
       data: {
         userId,
         kind: "KYC_FAILED",
-        title: "Identity check failed",
-        body: "Per platform policy, any escrowed contributions on not-yet-active listings were refunded in full.",
+        title: KYC_FAILED_TITLE,
+        body: KYC_FAILED_BODY,
       },
     });
 
@@ -66,4 +70,5 @@ export async function failKycAndRefund(userId: string) {
       });
     }
   }, TX_OPTIONS);
+  await sendNotificationEmails([userId], KYC_FAILED_TITLE, KYC_FAILED_BODY);
 }
