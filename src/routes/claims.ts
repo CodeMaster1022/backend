@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 import { sendNotificationEmails } from "../lib/notify.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 
 export const claimsRouter = Router();
 
@@ -16,15 +17,22 @@ claimsRouter.get(
   requireAuth,
   requireRole("ADMIN", "CARRIER"),
   wrap(async (req, res) => {
-    const claims = await prisma.claim.findMany({
-      where:
-        req.user!.role === "CARRIER" && req.user!.carrierId
-          ? { policy: { carrierId: req.user!.carrierId } }
-          : {},
-      include: { property: true, policy: true },
-      orderBy: { openedAt: "desc" },
-    });
-    res.json({ claims });
+    const where =
+      req.user!.role === "CARRIER" && req.user!.carrierId
+        ? { policy: { carrierId: req.user!.carrierId } }
+        : {};
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [claims, total] = await Promise.all([
+      prisma.claim.findMany({
+        where,
+        include: { property: true, policy: true },
+        orderBy: { openedAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.claim.count({ where }),
+    ]);
+    res.json({ claims, ...paginationMeta(total, page, pageSize) });
   }),
 );
 

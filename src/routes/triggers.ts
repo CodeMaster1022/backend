@@ -3,6 +3,7 @@ import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 import { radiusKmForPeril } from "../lib/labels.js";
 import { sendNotificationEmails } from "../lib/notify.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 import type { Peril } from "@prisma/client";
 
 export const triggersRouter = Router();
@@ -110,25 +111,31 @@ triggersRouter.get(
   requireAuth,
   requireRole("CARRIER", "ADMIN"),
   wrap(async (req, res) => {
-    const events = await prisma.triggerEventLog.findMany({
-      where:
-        req.user!.role === "CARRIER" && req.user!.carrierId
-          ? { policy: { carrierId: req.user!.carrierId } }
-          : {},
-      include: {
-        policy: { include: { listing: { include: { property: true } } } },
-      },
-      orderBy: { evaluatedAt: "desc" },
-      take: 100,
-    });
-    const policies = await prisma.policy.findMany({
-      where:
-        req.user!.role === "CARRIER" && req.user!.carrierId
-          ? { carrierId: req.user!.carrierId, active: true }
-          : { active: true },
-      include: { listing: { include: { property: true } }, watch: true },
-    });
-    res.json({ events, policies });
+    const eventsWhere =
+      req.user!.role === "CARRIER" && req.user!.carrierId
+        ? { policy: { carrierId: req.user!.carrierId } }
+        : {};
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [events, total, policies] = await Promise.all([
+      prisma.triggerEventLog.findMany({
+        where: eventsWhere,
+        include: {
+          policy: { include: { listing: { include: { property: true } } } },
+        },
+        orderBy: { evaluatedAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.triggerEventLog.count({ where: eventsWhere }),
+      prisma.policy.findMany({
+        where:
+          req.user!.role === "CARRIER" && req.user!.carrierId
+            ? { carrierId: req.user!.carrierId, active: true }
+            : { active: true },
+        include: { listing: { include: { property: true } }, watch: true },
+      }),
+    ]);
+    res.json({ events, policies, ...paginationMeta(total, page, pageSize) });
   }),
 );
 

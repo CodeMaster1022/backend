@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import { z } from "zod";
+import type { Prisma } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "../lib/db.js";
 import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.js";
 import { DISCLOSURE_VERSION, DISCLOSURE_TEXT, assertSafeCopy } from "../lib/copy.js";
@@ -12,6 +13,7 @@ import { notifyListingParties } from "../lib/notify.js";
 import { loadAndValidateContribution, finalizeContribution } from "../lib/contributions.js";
 import { stripe } from "../lib/stripe.js";
 import { isAllowedReturnUrl, firstAllowedOrigin } from "../lib/origins.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 
 export const listingsRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12_000_000 } });
@@ -72,28 +74,40 @@ listingsRouter.get(
   requireAuth,
   wrap(async (req, res) => {
     const role = req.user!.role;
-    const listings = await prisma.listing.findMany({
-      where:
-        role === "OWNER"
-          ? { property: { ownerId: req.user!.id } }
-          : role === "FUNDER"
-            ? {
-                OR: [
-                  {
-                    status: {
-                      in: ["LIVE", "FULLY_FUNDED", "ACTIVE", "TOPUP_WINDOW", "AWAITING_LENDER"],
-                    },
+    const where: Prisma.ListingWhereInput =
+      role === "OWNER"
+        ? { property: { ownerId: req.user!.id } }
+        : role === "FUNDER"
+          ? {
+              OR: [
+                {
+                  status: {
+                    in: ["LIVE", "FULLY_FUNDED", "ACTIVE", "TOPUP_WINDOW", "AWAITING_LENDER"],
                   },
-                  { contributions: { some: { userId: req.user!.id } } },
-                ],
-              }
-            : role === "CARRIER" && req.user!.carrierId
-              ? { quote: { quoteRequest: { carrierProduct: { carrierId: req.user!.carrierId } } } }
-              : {},
-      include: listingInclude,
-      orderBy: { createdAt: "desc" },
-    });
-    res.json({ listings });
+                },
+                { contributions: { some: { userId: req.user!.id } } },
+              ],
+            }
+          : role === "CARRIER" && req.user!.carrierId
+            ? { quote: { quoteRequest: { carrierProduct: { carrierId: req.user!.carrierId } } } }
+            : {};
+
+    // Paginate only when a caller explicitly asks for a page — /listings is
+    // also called unpaginated by pages that need the complete set to
+    // aggregate/group/filter client-side (commissions, portfolio, carrier
+    // policies grouping), and must keep getting everything back.
+    const paginate = req.query.page !== undefined;
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [listings, total] = await Promise.all([
+      prisma.listing.findMany({
+        where,
+        include: listingInclude,
+        orderBy: { createdAt: "desc" },
+        ...(paginate ? { skip, take } : {}),
+      }),
+      paginate ? prisma.listing.count({ where }) : Promise.resolve(0),
+    ]);
+    res.json({ listings, ...(paginate ? paginationMeta(total, page, pageSize) : {}) });
   }),
 );
 

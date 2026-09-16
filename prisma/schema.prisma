@@ -147,6 +147,7 @@ model User {
   kycStatus               KycStatus @default(PENDING)
   stripeIdentitySessionId String?
   carrierId               String?
+  disabledAt              DateTime?
   createdAt               DateTime  @default(now())
   updatedAt               DateTime  @updatedAt
 

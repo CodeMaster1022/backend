@@ -24,6 +24,10 @@ authRouter.post(
       res.status(401).json({ error: "Email or password is incorrect." });
       return;
     }
+    if (user.disabledAt) {
+      res.status(401).json({ error: "This account has been disabled." });
+      return;
+    }
     const sessionToken = await issueSession(user.id);
     res.cookie(COOKIE, sessionToken, sessionCookieOptions());
     res.json({ user: publicUser(user) });

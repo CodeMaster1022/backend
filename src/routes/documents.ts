@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/db.js";
 import { requireAuth, wrap } from "../middleware/auth.js";
 import { getObject } from "../lib/storage.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 
 export const documentsRouter = Router();
 
@@ -13,19 +14,20 @@ documentsRouter.get(
     // TAX_DOCUMENT is per-recipient — only the "I uploaded/was tagged as recipient
     // of this" branch should ever surface one, never the general "I own this
     // property/listing" branches (see the matching rule in GET /:id below).
-    const documents = await prisma.document.findMany({
-      where: {
-        OR: [
-          { uploadedById: userId },
-          { kind: { not: "TAX_DOCUMENT" }, property: { ownerId: userId } },
-          { kind: { not: "TAX_DOCUMENT" }, listing: { property: { ownerId: userId } } },
-          { kind: { not: "TAX_DOCUMENT" }, policy: { listing: { property: { ownerId: userId } } } },
-        ],
-      },
-      orderBy: { createdAt: "desc" },
-      take: 200,
-    });
-    res.json({ documents });
+    const where = {
+      OR: [
+        { uploadedById: userId },
+        { kind: { not: "TAX_DOCUMENT" as const }, property: { ownerId: userId } },
+        { kind: { not: "TAX_DOCUMENT" as const }, listing: { property: { ownerId: userId } } },
+        { kind: { not: "TAX_DOCUMENT" as const }, policy: { listing: { property: { ownerId: userId } } } },
+      ],
+    };
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [documents, total] = await Promise.all([
+      prisma.document.findMany({ where, orderBy: { createdAt: "desc" }, skip, take }),
+      prisma.document.count({ where }),
+    ]);
+    res.json({ documents, ...paginationMeta(total, page, pageSize) });
   }),
 );
 

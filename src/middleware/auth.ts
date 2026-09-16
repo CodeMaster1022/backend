@@ -24,7 +24,7 @@ export async function loadSession(req: Request, _res: Response, next: NextFuncti
       },
     },
   });
-  if (session && session.expires > new Date()) {
+  if (session && session.expires > new Date() && !session.user.disabledAt) {
     req.user = session.user;
   }
   next();

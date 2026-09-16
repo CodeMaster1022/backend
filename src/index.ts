@@ -16,6 +16,7 @@ import { notificationsRouter } from "./routes/notifications.js";
 import { carrierProductsRouter } from "./routes/carrier-products.js";
 import { organizationsRouter } from "./routes/organizations.js";
 import { invitesRouter } from "./routes/invites.js";
+import { usersRouter } from "./routes/users.js";
 import { loadSession } from "./middleware/auth.js";
 import { startSchedulers } from "./lib/scheduler.js";
 import { allowedOrigins } from "./lib/origins.js";
@@ -56,6 +57,7 @@ app.use("/notifications", notificationsRouter);
 app.use("/carrier-products", carrierProductsRouter);
 app.use("/organizations", organizationsRouter);
 app.use("/invites", invitesRouter);
+app.use("/users", usersRouter);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);

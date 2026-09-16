@@ -4,6 +4,8 @@ import { z } from "zod";
 import { Role, WaitlistRole } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
+import { sendEmail } from "../lib/email.js";
 
 export const waitlistRouter = Router();
 
@@ -53,9 +55,13 @@ waitlistRouter.get(
   "/",
   requireAuth,
   requireRole("ADMIN"),
-  wrap(async (_req, res) => {
-    const rows = await prisma.waitlistSignup.findMany({ orderBy: { createdAt: "desc" } });
-    res.json({ waitlist: rows });
+  wrap(async (req, res) => {
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [rows, total] = await Promise.all([
+      prisma.waitlistSignup.findMany({ orderBy: { createdAt: "desc" }, skip, take }),
+      prisma.waitlistSignup.count(),
+    ]);
+    res.json({ waitlist: rows, ...paginationMeta(total, page, pageSize) });
   }),
 );
 
@@ -109,9 +115,13 @@ waitlistRouter.post(
 
     await prisma.waitlistSignup.update({ where: { id: row.id }, data: { invitedAt: new Date() } });
 
-    res.status(201).json({
-      invite,
-      inviteUrl: `${process.env.UI_ORIGIN ?? "http://localhost:3000"}/register/${token}`,
+    const inviteUrl = `${process.env.UI_ORIGIN ?? "http://localhost:3000"}/register/${token}`;
+    await sendEmail({
+      to: row.email,
+      subject: "You're invited to FiSure",
+      text: `Hi ${row.name},\n\nYou've been approved for FiSure. Set up your account here:\n${inviteUrl}\n\nThis link expires in 7 days.`,
     });
+
+    res.status(201).json({ invite, inviteUrl });
   }),
 );

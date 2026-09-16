@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma, TX_OPTIONS } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 import { radiusKmForPeril } from "../lib/labels.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 import {
   bufferPassed,
   dollarsToCents,
@@ -30,25 +31,32 @@ quotesRouter.get(
   requireAuth,
   requireRole("CARRIER", "ADMIN"),
   wrap(async (req, res) => {
-    const requests = await prisma.quoteRequest.findMany({
-      where:
-        req.user!.role === "CARRIER" && req.user!.carrierId
-          ? { carrierProduct: { carrierId: req.user!.carrierId } }
-          : {},
-      include: {
-        property: {
-          include: {
-            mortgage: true,
-            owner: { select: { email: true, name: true, kycStatus: true } },
-            documents: true,
+    const where =
+      req.user!.role === "CARRIER" && req.user!.carrierId
+        ? { carrierProduct: { carrierId: req.user!.carrierId } }
+        : {};
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [requests, total] = await Promise.all([
+      prisma.quoteRequest.findMany({
+        where,
+        include: {
+          property: {
+            include: {
+              mortgage: true,
+              owner: { select: { email: true, name: true, kycStatus: true } },
+              documents: true,
+            },
           },
+          carrierProduct: true,
+          quote: true,
         },
-        carrierProduct: true,
-        quote: true,
-      },
-      orderBy: { submittedAt: "desc" },
-    });
-    res.json({ requests });
+        orderBy: { submittedAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.quoteRequest.count({ where }),
+    ]);
+    res.json({ requests, ...paginationMeta(total, page, pageSize) });
   }),
 );
 

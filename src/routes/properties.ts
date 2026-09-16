@@ -7,6 +7,7 @@ import { requireAuth, requireKyc, requireRole, wrap } from "../middleware/auth.j
 import { dollarsToCents, requiredCoverageCents, usd } from "../lib/money.js";
 import { putObject, safeKey } from "../lib/storage.js";
 import { notifyCarrierNewQuoteRequest } from "../lib/notify.js";
+import { parsePagination, paginationMeta } from "../lib/pagination.js";
 
 export const propertiesRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8_000_000 } });
@@ -40,17 +41,23 @@ propertiesRouter.get(
   requireAuth,
   wrap(async (req, res) => {
     const where = req.user!.role === "ADMIN" ? {} : { ownerId: req.user!.id };
-    const properties = await prisma.property.findMany({
-      where,
-      include: {
-        mortgage: true,
-        eligibility: { orderBy: { checkedAt: "desc" }, take: 1 },
-        listings: { include: { quote: true, policy: true } },
-        quoteRequests: { include: { quote: true, carrierProduct: true } },
-      },
-      orderBy: { createdAt: "desc" },
-    });
-    res.json({ properties });
+    const { page, pageSize, skip, take } = parsePagination(req.query);
+    const [properties, total] = await Promise.all([
+      prisma.property.findMany({
+        where,
+        include: {
+          mortgage: true,
+          eligibility: { orderBy: { checkedAt: "desc" }, take: 1 },
+          listings: { include: { quote: true, policy: true } },
+          quoteRequests: { include: { quote: true, carrierProduct: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.property.count({ where }),
+    ]);
+    res.json({ properties, ...paginationMeta(total, page, pageSize) });
   }),
 );
 
