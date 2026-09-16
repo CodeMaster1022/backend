@@ -26,6 +26,7 @@ usersRouter.get(
           kycStatus: true,
           carrierId: true,
           disabledAt: true,
+          lastLoginAt: true,
           createdAt: true,
         },
       }),

@@ -29,6 +29,7 @@ authRouter.post(
       return;
     }
     const sessionToken = await issueSession(user.id);
+    await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
     res.cookie(COOKIE, sessionToken, sessionCookieOptions());
     res.json({ user: publicUser(user) });
   }),
