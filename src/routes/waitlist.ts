@@ -116,12 +116,12 @@ waitlistRouter.post(
     await prisma.waitlistSignup.update({ where: { id: row.id }, data: { invitedAt: new Date() } });
 
     const inviteUrl = `${process.env.UI_ORIGIN ?? "http://207.241.172.34:3000"}/register/${token}`;
-    await sendEmail({
+    const emailSent = await sendEmail({
       to: row.email,
       subject: "You're invited to FiSure",
       text: `Hi ${row.name},\n\nYou've been approved for FiSure. Set up your account here:\n${inviteUrl}\n\nThis link expires in 7 days.`,
     });
 
-    res.status(201).json({ invite, inviteUrl });
+    res.status(201).json({ invite, inviteUrl, emailSent });
   }),
 );
