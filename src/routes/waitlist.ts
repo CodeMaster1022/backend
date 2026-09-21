@@ -124,4 +124,4 @@ waitlistRouter.post(
 
     res.status(201).json({ invite, inviteUrl, emailSent });
   }),
-);
+)

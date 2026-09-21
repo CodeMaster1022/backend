@@ -4,15 +4,7 @@ import { prisma, TX_OPTIONS } from "../lib/db.js";
 import { requireAuth, requireRole, wrap } from "../middleware/auth.js";
 import { radiusKmForPeril } from "../lib/labels.js";
 import { parsePagination, paginationMeta } from "../lib/pagination.js";
-import {
-  bufferPassed,
-  dollarsToCents,
-  listingWindow,
-  minimumPayableCents,
-  requiredCoverageCents,
-  suggestedMinimumCoverageCents,
-  usd,
-} from "../lib/money.js";
+import { bufferPassed, dollarsToCents, listingWindow, requiredCoverageCents, usd } from "../lib/money.js";
 
 export const quotesRouter = Router();
 
@@ -117,27 +109,18 @@ quotesRouter.post(
     }
 
     const mortgageCents = request.property.mortgage?.outstandingBalanceCents ?? 0;
-    const minPayable = minimumPayableCents(
-      coverageCents,
-      request.carrierProduct.payoutSchedule,
-    );
+    const propertyValueCents = request.property.estimatedValueCents;
     const required = requiredCoverageCents(mortgageCents);
-    if (!bufferPassed(minPayable, mortgageCents)) {
-      let error: string;
-      if (!request.carrierProduct.payoutSchedule) {
-        error = `Coverage fails the 35% buffer. ${usd(coverageCents)} of coverage is below the required ${usd(required)} (mortgage × 1.35).`;
-      } else {
-        const suggestion = suggestedMinimumCoverageCents(
-          mortgageCents,
-          request.carrierProduct.payoutSchedule,
-        );
-        error = `Coverage fails the 35% buffer. This product's payout schedule caps the minimum payable at ${usd(minPayable)} for ${usd(coverageCents)} of stated coverage — that must be at least ${usd(required)} (mortgage × 1.35). ${
-          suggestion.achievable
-            ? `Enter at least ${usd(suggestion.coverageCents)} of coverage to clear the minimum payable band.`
-            : "This product's payout schedule cannot clear the required buffer at any coverage amount — a fixed-dollar band is set below the required minimum."
-        }`;
-      }
-      res.status(400).json({ error });
+    if (!bufferPassed(coverageCents, mortgageCents)) {
+      res.status(400).json({
+        error: `Coverage fails the 35% buffer. ${usd(coverageCents)} of coverage is below the required ${usd(required)} (mortgage × 1.35).`,
+      });
+      return;
+    }
+    if (coverageCents > propertyValueCents) {
+      res.status(400).json({
+        error: `Coverage cannot exceed the property's estimated value of ${usd(propertyValueCents)}. ${usd(coverageCents)} was entered.`,
+      });
       return;
     }
 
@@ -187,7 +170,7 @@ quotesRouter.post(
           inRiskZone: true,
           requiredCoverageCents: required,
           proposedCoverageCents: coverageCents,
-          notes: "Re-checked at quote using coverage and payout schedule minimum.",
+          notes: "Re-checked at quote: stated coverage against mortgage × 1.35 and capped at property value.",
         },
       });
     }, TX_OPTIONS);
