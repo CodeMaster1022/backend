@@ -281,10 +281,20 @@ listingsRouter.post(
   wrap(async (req, res) => {
     const listing = await prisma.listing.findUnique({
       where: { id: req.params.id as string },
-      include: { property: { include: { mortgage: true } } },
+      include: {
+        property: { include: { mortgage: true } },
+        quote: { include: { quoteRequest: { include: { carrierProduct: true } } } },
+      },
     });
     if (!listing) {
       res.status(404).json({ error: "Listing not found." });
+      return;
+    }
+    if (
+      req.user!.role === "CARRIER" &&
+      listing.quote.quoteRequest.carrierProduct.carrierId !== req.user!.carrierId
+    ) {
+      res.status(403).json({ error: "This listing is not in your book." });
       return;
     }
     await prisma.$transaction(async (tx) => {
@@ -321,6 +331,13 @@ listingsRouter.post(
     });
     if (!listing) {
       res.status(404).json({ error: "Listing not found." });
+      return;
+    }
+    if (
+      req.user!.role === "CARRIER" &&
+      listing.quote.quoteRequest.carrierProduct.carrierId !== req.user!.carrierId
+    ) {
+      res.status(403).json({ error: "This listing is not in your book." });
       return;
     }
     if (listing.status !== "FULLY_FUNDED" && listing.status !== "AWAITING_LENDER") {
@@ -373,11 +390,15 @@ listingsRouter.post(
 
     let boundPolicyId = "";
     await prisma.$transaction(async (tx) => {
+      // Negative: both are outflows from escrow, same sign convention as REFUND.
+      // Premium in (positive) minus fee + remittance out (negative) nets a bound
+      // listing's ledger to exactly zero, which is what makes it a usable
+      // trust-account balance.
       await tx.escrowLedger.create({
         data: {
           listingId: listing.id,
           type: "PLATFORM_FEE",
-          amountCents: fee,
+          amountCents: -fee,
           note: "Tiered commission on full funded premium",
         },
       });
@@ -385,7 +406,7 @@ listingsRouter.post(
         data: {
           listingId: listing.id,
           type: "CARRIER_REMITTANCE",
-          amountCents: remittance,
+          amountCents: -remittance,
           note: "Instruction to premium-finance partner",
         },
       });
@@ -457,6 +478,10 @@ listingsRouter.post(
       res.status(400).json({ error: "Bind the policy before uploading documents." });
       return;
     }
+    if (req.user!.role === "CARRIER" && listing.policy.carrierId !== req.user!.carrierId) {
+      res.status(403).json({ error: "This policy is not in your book." });
+      return;
+    }
     const key = safeKey(["policies", listing.policy.id, file.originalname]);
     await putObject({
       key,
@@ -509,6 +534,7 @@ export async function refundListing(listingId: string, reason: string) {
       data: {
         status: listing.status === "TOPUP_WINDOW" ? "TOPUP_LAPSED" : "EXPIRED",
         fundedCents: 0,
+        ownerContributionCents: 0,
       },
     });
   }, TX_OPTIONS);
@@ -534,5 +560,19 @@ export async function expireOrTopUpListings() {
   for (const listing of lapsed) {
     await refundListing(listing.id, "Top-up window lapsed. Full refund. No fee.");
   }
-  return { expired: liveExpired.length, lapsed: lapsed.length };
+
+  // Fully funded but never bound before the quote expired: bind is permanently
+  // blocked from here and neither cancel nor the sweeps above touch these
+  // statuses, so without this pass the contributors' money is trapped forever.
+  const staleQuote = await prisma.listing.findMany({
+    where: {
+      status: { in: ["FULLY_FUNDED", "AWAITING_LENDER"] },
+      quote: { validUntil: { lte: now } },
+    },
+  });
+  for (const listing of staleQuote) {
+    await refundListing(listing.id, "Quote expired before bind. Full refund. No fee.");
+  }
+
+  return { expired: liveExpired.length, lapsed: lapsed.length, staleQuote: staleQuote.length };
 }

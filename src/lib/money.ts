@@ -12,7 +12,10 @@ export function bps(numerator: number, denominator: number) {
 }
 
 export function requiredCoverageCents(mortgageCents: number) {
-  return Math.ceil(mortgageCents * 1.35);
+  // Integer arithmetic, not `* 1.35`: floating point makes 24000000 * 1.35
+  // land on 32400000.000000004, so Math.ceil added a phantom cent and the
+  // displayed minimum was rejected when typed back.
+  return Math.ceil((mortgageCents * 135) / 100);
 }
 
 export function bufferPassed(coverageCents: number, mortgageCents: number) {

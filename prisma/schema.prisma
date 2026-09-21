@@ -360,6 +360,10 @@ model Listing {
   expiresAt              DateTime?
   topUpEndsAt            DateTime?
   lenderNamedLossPayee   Boolean       @default(false)
+  // Optimistic-concurrency token. finalizeContribution writes an absolute
+  // fundedCents derived from a prior read, so the write is conditioned on the
+  // version it read to stop two concurrent contributions losing an update.
+  version                Int           @default(0)
   createdAt              DateTime      @default(now())
   updatedAt              DateTime      @updatedAt
 

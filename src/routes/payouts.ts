@@ -14,10 +14,12 @@ const previewSchema = z.object({
   ownerBps: z.coerce.number().min(0).max(10_000).default(0),
 });
 
+// No `mortgage` here on purpose: it's read from the property's real mortgage
+// balance server-side. It used to be operator-typed, so a decimal typo silently
+// redirected the whole waterfall to the lender.
 const createPayoutSchema = z.object({
   policyId: z.string().trim().min(1, "Policy is required."),
   gross: z.coerce.number().positive("Enter gross proceeds."),
-  mortgage: z.coerce.number().min(0).default(0),
 });
 
 payoutsRouter.get(
@@ -31,6 +33,7 @@ payoutsRouter.get(
           include: {
             property: { include: { mortgage: true, owner: true } },
             contributions: { where: { status: "SUCCEEDED" }, include: { user: true } },
+            quote: true,
           },
         },
         payouts: { include: { lines: true } },
@@ -76,7 +79,6 @@ payoutsRouter.post(
     }
     const policyId = parsed.data.policyId;
     const grossCents = Math.round(parsed.data.gross * 100);
-    const mortgageCents = Math.round(parsed.data.mortgage * 100);
     const policy = await prisma.policy.findUnique({
       where: { id: policyId },
       include: {
@@ -84,12 +86,22 @@ payoutsRouter.post(
           include: {
             property: { include: { mortgage: true, owner: true } },
             contributions: { where: { status: "SUCCEEDED" }, include: { user: true } },
+            quote: true,
           },
         },
       },
     });
     if (!policy) {
       res.status(404).json({ error: "Policy not found." });
+      return;
+    }
+
+    const mortgageCents = policy.listing.property.mortgage?.outstandingBalanceCents ?? 0;
+    const coverageCents = policy.listing.quote.coverageCents;
+    if (coverageCents !== null && grossCents > coverageCents) {
+      res.status(400).json({
+        error: `Gross proceeds cannot exceed the policy's coverage of ${usd(coverageCents)}. ${usd(grossCents)} was entered.`,
+      });
       return;
     }
 
@@ -126,19 +138,28 @@ payoutsRouter.post(
       },
     ];
 
-    for (const contribution of policy.listing.contributions) {
-      if (contribution.userId === policy.listing.property.ownerId) continue;
-      const share =
-        funderTotal > 0
+    // Rounding each share independently lets the lines sum to more or less than
+    // the pool, so the last funder absorbs the residual and the lines always
+    // total exactly funderPoolCents.
+    const funderContributions = policy.listing.contributions.filter(
+      (row) => row.userId !== policy.listing.property.ownerId,
+    );
+    let allocatedCents = 0;
+    funderContributions.forEach((contribution, index) => {
+      const isLast = index === funderContributions.length - 1;
+      const share = isLast
+        ? split.funderPoolCents - allocatedCents
+        : funderTotal > 0
           ? Math.round((split.funderPoolCents * contribution.amountCents) / funderTotal)
           : 0;
+      allocatedCents += share;
       lines.push({
         payee: "FUNDER",
         amountCents: share,
         userId: contribution.userId,
         note: `${contribution.user.email} pro-rata`,
       });
-    }
+    });
 
     const text = [
       "Manual payout instruction — not an automated disbursement",

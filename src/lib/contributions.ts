@@ -1,4 +1,4 @@
-import type { ListingStatus } from "@prisma/client";
+import { Prisma, type ListingStatus } from "@prisma/client";
 import { prisma, TX_OPTIONS } from "./db.js";
 import { flags } from "./flags.js";
 import { DISCLOSURE_VERSION } from "./copy.js";
@@ -14,8 +14,12 @@ const listingIncludeForContribution = {
  * Every check here must be re-run at finalize time (not just before sending a
  * contributor to Stripe Checkout), since listing state can change in the
  * minutes between session creation and payment confirmation — e.g. someone
- * else's contribution filling the remaining premium first. That's what keeps
- * this safe against races, not just against a single request.
+ * else's contribution filling the remaining premium first.
+ *
+ * Re-reading alone does NOT make this race-safe: the read happens outside the
+ * write transaction, so two callers can both pass these checks against the same
+ * snapshot. `finalizeContribution` closes that gap by conditioning its write on
+ * the `version` it read here and retrying on conflict.
  */
 export async function loadAndValidateContribution(params: {
   listingId: string;
@@ -90,6 +94,15 @@ export async function loadAndValidateContribution(params: {
   return { ok: true as const, listing };
 }
 
+const MAX_CONTRIBUTION_ATTEMPTS = 3;
+
+/**
+ * Retries only on a lost optimistic-concurrency race (another contribution
+ * landed between our read and our write), re-reading and re-validating fresh
+ * each time. A genuine validation failure returns immediately, so callers like
+ * the Stripe webhook keep treating `{ ok: false }` as "this contribution can no
+ * longer be applied — refund it".
+ */
 export async function finalizeContribution(params: {
   listingId: string;
   userId: string;
@@ -99,8 +112,27 @@ export async function finalizeContribution(params: {
   stripePaymentIntentId: string | null;
   note: string;
 }) {
+  for (let attempt = 1; attempt <= MAX_CONTRIBUTION_ATTEMPTS; attempt += 1) {
+    const result = await attemptContribution(params);
+    if (result.outcome !== "CONFLICT") return result.value;
+  }
+  return {
+    ok: false as const,
+    error: "This listing is being updated by other contributions. Please try again.",
+  };
+}
+
+async function attemptContribution(params: {
+  listingId: string;
+  userId: string;
+  userRole: string;
+  amountCents: number;
+  asOwner: boolean;
+  stripePaymentIntentId: string | null;
+  note: string;
+}) {
   const check = await loadAndValidateContribution(params);
-  if (!check.ok) return check;
+  if (!check.ok) return { outcome: "DONE" as const, value: check };
   const listing = check.listing;
   const listingId = params.listingId;
 
@@ -126,46 +158,65 @@ export async function finalizeContribution(params: {
   const justWentLive = nextStatus === "LIVE" && listing.status !== "LIVE";
   const hasMortgage = Boolean(listing.property.mortgage);
 
-  await prisma.$transaction(async (tx) => {
-    await tx.contribution.create({
-      data: {
-        listingId,
-        userId: params.userId,
-        organizationId: params.asOwner ? null : membership?.organizationId,
-        amountCents: params.amountCents,
-        status: "SUCCEEDED",
-        stripePaymentIntentId: params.stripePaymentIntentId,
-      },
-    });
-    await tx.escrowLedger.create({
-      data: {
-        listingId,
-        type: params.asOwner ? "OWNER_PREMIUM" : "FUNDER_PREMIUM",
-        amountCents: params.amountCents,
-        partyUserId: params.userId,
-        stripePaymentIntentId: params.stripePaymentIntentId,
-        note: params.note,
-      },
-    });
-    await tx.listing.update({
-      where: { id: listingId },
-      data: {
-        fundedCents: nextFunded,
-        ownerContributionCents: nextOwner,
-        status: nextStatus,
-        liveAt: nextStatus === "LIVE" && !listing.liveAt ? new Date() : listing.liveAt,
-        ...(justWentLive && hasMortgage ? { lenderNamedLossPayee: true } : {}),
-      },
-    });
-    // Lender is automatically named loss payee and notified the moment a
-    // listing goes live, per BRD §2.3/§8.2 — not a manual admin step.
-    if (justWentLive && hasMortgage) {
-      await tx.mortgage.update({
-        where: { propertyId: listing.propertyId },
-        data: { notifiedAt: new Date() },
+  let applied: boolean;
+  try {
+    applied = await prisma.$transaction(async (tx) => {
+      // Conditioned on the version we read: if another contribution landed
+      // first, count is 0 and we abandon this attempt without writing
+      // anything else. On MongoDB, two concurrent transactions writing the
+      // same document can also surface as a thrown write-conflict (P2034)
+      // rather than a mismatched count — caught below and treated the same way.
+      const claimed = await tx.listing.updateMany({
+        where: { id: listingId, version: listing.version },
+        data: {
+          fundedCents: nextFunded,
+          ownerContributionCents: nextOwner,
+          status: nextStatus,
+          version: { increment: 1 },
+          liveAt: nextStatus === "LIVE" && !listing.liveAt ? new Date() : listing.liveAt,
+          ...(justWentLive && hasMortgage ? { lenderNamedLossPayee: true } : {}),
+        },
       });
+      if (claimed.count !== 1) return false;
+
+      await tx.contribution.create({
+        data: {
+          listingId,
+          userId: params.userId,
+          organizationId: params.asOwner ? null : membership?.organizationId,
+          amountCents: params.amountCents,
+          status: "SUCCEEDED",
+          stripePaymentIntentId: params.stripePaymentIntentId,
+        },
+      });
+      await tx.escrowLedger.create({
+        data: {
+          listingId,
+          type: params.asOwner ? "OWNER_PREMIUM" : "FUNDER_PREMIUM",
+          amountCents: params.amountCents,
+          partyUserId: params.userId,
+          stripePaymentIntentId: params.stripePaymentIntentId,
+          note: params.note,
+        },
+      });
+      // Lender is automatically named loss payee and notified the moment a
+      // listing goes live, per BRD §2.3/§8.2 — not a manual admin step.
+      if (justWentLive && hasMortgage) {
+        await tx.mortgage.update({
+          where: { propertyId: listing.propertyId },
+          data: { notifiedAt: new Date() },
+        });
+      }
+      return true;
+    }, TX_OPTIONS);
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2034") {
+      return { outcome: "CONFLICT" as const };
     }
-  }, TX_OPTIONS);
+    throw err;
+  }
+
+  if (!applied) return { outcome: "CONFLICT" as const };
 
   // listing.status can never already be FULLY_FUNDED here — every path above
   // rejects a contribution unless the listing was AWAITING_OWNER_FUNDS,
@@ -185,5 +236,5 @@ export async function finalizeContribution(params: {
     });
   }
 
-  return { ok: true as const, fullyFunded, status: nextStatus };
+  return { outcome: "DONE" as const, value: { ok: true as const, fullyFunded, status: nextStatus } };
 }
